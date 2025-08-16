@@ -283,7 +283,7 @@ void AudioInputCallback(void * inUserData,
 
     // Clean up callback data before removing job
     if (state->job->params.new_segment_callback_user_data) {
-        cleanup_callback_data(state->job->params.new_segment_callback_user_data);
+        cleanup_callback_data(&state->job->params.new_segment_callback_user_data);
     }
 
     rnwhisper::job_remove(state->job->job_id);
@@ -403,21 +403,25 @@ void AudioInputCallback(void * inUserData,
 }
 
 struct rnwhisper_segments_callback_data {
-    void (^onNewSegments)(NSDictionary *);
+    void (^ __unsafe_unretained onNewSegments)(NSDictionary *); // Explicitly mark as unsafe_unretained
     int total_n_new;
     bool tdrzEnable;
     bool isHeapAllocated; // Track if this needs cleanup
 };
 
 // Helper function to clean up callback data
-void cleanup_callback_data(void *user_data) {
-    if (user_data) {
-        struct rnwhisper_segments_callback_data *data = (struct rnwhisper_segments_callback_data *)user_data;
+void cleanup_callback_data(void **user_data_ptr) {
+    if (user_data_ptr && *user_data_ptr) {
+        struct rnwhisper_segments_callback_data *data = (struct rnwhisper_segments_callback_data *)*user_data_ptr;
         if (data->isHeapAllocated) {
-            // onNewSegments will be automatically released when the struct is freed
-            // since we used [block copy] which creates an autoreleasing reference
+            // Explicitly release the block using Block_release
+            if (data->onNewSegments) {
+                Block_release(data->onNewSegments);
+            }
             free(data);
         }
+        // Set pointer to null to prevent double cleanup
+        *user_data_ptr = nullptr;
     }
 }
 
@@ -455,16 +459,20 @@ void cleanup_callback_data(void *user_data) {
                     for (int i = data->total_n_new - n_new; i < data->total_n_new; i++) {
                         const char *text_cur = whisper_full_get_segment_text(ctx, i);
 
-                        // Safe decode: handle invalid UTF-8 without returning nil
+                        // Safe decode: handle invalid UTF-8 with replacement characters
                         NSString *segText = @"";
                         if (text_cur) {
                             // Try UTF-8 first
                             segText = [NSString stringWithCString:text_cur encoding:NSUTF8StringEncoding];
                             if (!segText) {
-                                // Fall back: treat bytes as Latin-1 to avoid nil (common trick for "dirty" UTF-8)
-                                size_t len = strlen(text_cur);
-                                NSData *bytes = [NSData dataWithBytes:text_cur length:len];
-                                segText = [[NSString alloc] initWithData:bytes encoding:NSISOLatin1StringEncoding] ?: @"";
+                                // Use CoreFoundation lossy conversion to preserve data with replacement chars
+                                CFStringRef cf = CFStringCreateWithBytes(kCFAllocatorDefault,
+                                                                         (const UInt8 *)text_cur,
+                                                                         strlen(text_cur),
+                                                                         kCFStringEncodingUTF8,
+                                                                         /*isExternalRepresentation*/ false);
+                                segText = CFBridgingRelease(cf);
+                                if (!segText) segText = @"\uFFFD"; // replacement char
                             }
                         }
 
@@ -493,14 +501,18 @@ void cleanup_callback_data(void *user_data) {
                     };
 
                     void (^onNewSegments)(NSDictionary *) = data->onNewSegments;
-                    if (onNewSegments) onNewSegments(result);
+                    if (onNewSegments) {
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            onNewSegments(result);
+                        });
+                    }
                 }
             };
 
             // IMPORTANT: user_data must outlive the callback, and blocks must be copied to the heap.
             struct rnwhisper_segments_callback_data *user_data =
                 (struct rnwhisper_segments_callback_data *)calloc(1, sizeof(*user_data));
-            user_data->onNewSegments = [onNewSegments copy];
+            user_data->onNewSegments = (__typeof(user_data->onNewSegments))Block_copy(onNewSegments);
             user_data->tdrzEnable = (options[@"tdrzEnable"] && [options[@"tdrzEnable"] boolValue]);
             user_data->total_n_new = 0;
             user_data->isHeapAllocated = true;
@@ -514,7 +526,7 @@ void cleanup_callback_data(void *user_data) {
 
         // Clean up callback data before removing job
         if (job->params.new_segment_callback_user_data) {
-            cleanup_callback_data(job->params.new_segment_callback_user_data);
+            cleanup_callback_data(&job->params.new_segment_callback_user_data);
         }
 
         rnwhisper::job_remove(jobId);
