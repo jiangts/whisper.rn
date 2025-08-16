@@ -151,6 +151,7 @@ static void* retained_log_block = nullptr;
     self->recordState.isTranscribing = false;
     self->recordState.isCapturing = false;
     self->recordState.isStoppedByAction = false;
+    self->recordState.didEnd = false;
 
     self->recordState.sliceIndex = 0;
     self->recordState.transcribeSliceIndex = 0;
@@ -265,6 +266,12 @@ void AudioInputCallback(void * inUserData,
 }
 
 - (void)finishRealtimeTranscribe:(RNWhisperContextRecordState*) state result:(NSDictionary*)result {
+    // Prevent double end emission
+    if (state->didEnd) {
+        return;
+    }
+    state->didEnd = true;
+
     // Save wav if needed
     if (state->job->audio_output_path != nullptr) {
         // TODO: Append in real time so we don't need to keep all slices & also reduce memory usage
@@ -407,7 +414,7 @@ void AudioInputCallback(void * inUserData,
 }
 
 struct rnwhisper_segments_callback_data {
-    void (^ __unsafe_unretained onNewSegments)(NSDictionary *); // Explicitly mark as unsafe_unretained
+    void *onNewSegments; // Store as raw void* for manual ownership
     int total_n_new;
     bool tdrzEnable;
     bool isHeapAllocated; // Track if this needs cleanup
@@ -418,7 +425,7 @@ void cleanup_callback_data(void **user_data_ptr) {
     if (user_data_ptr && *user_data_ptr) {
         struct rnwhisper_segments_callback_data *data = (struct rnwhisper_segments_callback_data *)*user_data_ptr;
         if (data->isHeapAllocated) {
-            // Explicitly release the block using Block_release
+            // Release the block stored as void*
             if (data->onNewSegments) {
                 Block_release(data->onNewSegments);
             }
@@ -500,11 +507,11 @@ void cleanup_callback_data(void **user_data_ptr) {
                     NSDictionary *result = @{
                         @"nNew": @(n_new),
                         @"totalNNew": @(data->total_n_new),
-                        @"result": builder,                                   // non-nil (possibly empty)
-                        @"segments": segments
+                        @"result": [builder copy],                            // immutable copy
+                        @"segments": [segments copy]                          // immutable copy
                     };
 
-                    void (^onNewSegments)(NSDictionary *) = data->onNewSegments;
+                    void (^onNewSegments)(NSDictionary *) = (void (^)(NSDictionary *))data->onNewSegments;
                     if (onNewSegments) {
                         dispatch_async(dispatch_get_main_queue(), ^{
                             onNewSegments(result);
@@ -516,7 +523,7 @@ void cleanup_callback_data(void **user_data_ptr) {
             // IMPORTANT: user_data must outlive the callback, and blocks must be copied to the heap.
             struct rnwhisper_segments_callback_data *user_data =
                 (struct rnwhisper_segments_callback_data *)calloc(1, sizeof(*user_data));
-            user_data->onNewSegments = (__typeof(user_data->onNewSegments))Block_copy(onNewSegments);
+            user_data->onNewSegments = Block_copy(onNewSegments);
             user_data->tdrzEnable = (options[@"tdrzEnable"] && [options[@"tdrzEnable"] boolValue]);
             user_data->total_n_new = 0;
             user_data->isHeapAllocated = true;
@@ -556,9 +563,12 @@ void cleanup_callback_data(void **user_data_ptr) {
     if (self->recordState.job != nullptr) self->recordState.job->abort();
     if (self->recordState.isRealtime && self->recordState.isCapturing) {
         [self stopAudio];
-        if (!self->recordState.isTranscribing) {
-            // Handle for VAD case
-            self->recordState.transcribeHandler(jobId, @"end", @{});
+        if (!self->recordState.isTranscribing && !self->recordState.didEnd) {
+            // Handle for VAD case - only if we haven't already ended
+            self->recordState.didEnd = true;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self->recordState.transcribeHandler(jobId, @"end", @{});
+            });
         }
     }
     self->recordState.isCapturing = false;
@@ -669,16 +679,20 @@ void cleanup_callback_data(void **user_data_ptr) {
         for (int i = 0; i < n_segments; i++) {
             const char *text_cur = whisper_full_get_segment_text(self->ctx, i);
 
-            // Safe decode: handle invalid UTF-8 without returning nil
+            // Safe decode: handle invalid UTF-8 with replacement characters (consistent with callback)
             NSString *segText = @"";
             if (text_cur) {
                 // Try UTF-8 first
                 segText = [NSString stringWithCString:text_cur encoding:NSUTF8StringEncoding];
                 if (!segText) {
-                    // Fall back: treat bytes as Latin-1 to avoid nil (common trick for "dirty" UTF-8)
-                    size_t len = strlen(text_cur);
-                    NSData *bytes = [NSData dataWithBytes:text_cur length:len];
-                    segText = [[NSString alloc] initWithData:bytes encoding:NSISOLatin1StringEncoding] ?: @"";
+                    // Use CoreFoundation lossy conversion to preserve data with replacement chars
+                    CFStringRef cf = CFStringCreateWithBytes(kCFAllocatorDefault,
+                                                             (const UInt8 *)text_cur,
+                                                             strlen(text_cur),
+                                                             kCFStringEncodingUTF8,
+                                                             /*isExternalRepresentation*/ false);
+                    segText = CFBridgingRelease(cf);
+                    if (!segText) segText = @"\uFFFD"; // replacement char
                 }
             }
 
@@ -702,8 +716,8 @@ void cleanup_callback_data(void **user_data_ptr) {
             [segments addObject:segment];
         }
         NSMutableDictionary *result = [[NSMutableDictionary alloc] init];
-        result[@"result"] = builder;                                   // non-nil (possibly empty)
-        result[@"segments"] = segments;
+        result[@"result"] = [builder copy];                            // immutable copy
+        result[@"segments"] = [segments copy];                         // immutable copy
         return result;
     }
 }

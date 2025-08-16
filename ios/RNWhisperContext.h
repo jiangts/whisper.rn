@@ -24,6 +24,7 @@ typedef struct {
     bool isRealtime;
     bool isCapturing;
     bool isStoppedByAction;
+    bool didEnd;
     int nSamplesTranscribing;
     std::vector<int> sliceNSamples;
     bool isUseSlices;
