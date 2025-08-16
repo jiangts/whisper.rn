@@ -22,33 +22,27 @@ static void* retained_log_block = nullptr;
 
 + (void)toggleNativeLog:(BOOL)enabled onEmitLog:(void (^)(NSString *level, NSString *text))onEmitLog {
   if (enabled) {
-      void (^copiedBlock)(NSString *, NSString *) = [onEmitLog copy];
-      retained_log_block = (__bridge_retained void *)(copiedBlock);
-      whisper_log_set([](enum wsp_ggml_log_level level, const char * text, void * data) {
-          whisper_log_callback_default(level, text, data);
-          NSString *levelStr = @"";
-          if (level == WSP_GGML_LOG_LEVEL_ERROR) {
-              levelStr = @"error";
-          } else if (level == WSP_GGML_LOG_LEVEL_INFO) {
-              levelStr = @"info";
-          } else if (level == WSP_GGML_LOG_LEVEL_WARN) {
-              levelStr = @"warn";
-          }
+    // release old if set
+    if (retained_log_block) { CFRelease(retained_log_block); retained_log_block = nullptr; }
 
-          NSString *textStr = [NSString stringWithUTF8String:text];
-          // NOTE: Convert to UTF-8 string may fail
-          if (!textStr) {
-              return;
-          }
-          void (^block)(NSString *, NSString *) = (__bridge void (^)(NSString *, NSString *))(data);
-          block(levelStr, textStr);
-      }, retained_log_block);
+    void (^copiedBlock)(NSString *, NSString *) = [onEmitLog copy];
+    retained_log_block = (__bridge_retained void *)copiedBlock;
+
+    whisper_log_set([](enum wsp_ggml_log_level level, const char *text, void *data) {
+      whisper_log_callback_default(level, text, data);
+
+      NSString *levelStr = (level == WSP_GGML_LOG_LEVEL_ERROR) ? @"error" :
+                           (level == WSP_GGML_LOG_LEVEL_WARN)  ? @"warn"  : @"info";
+
+      NSString *textStr = [NSString stringWithCString:text encoding:NSUTF8StringEncoding];
+      if (!textStr) { textStr = @"\uFFFD"; } // replacement char fallback
+
+      void (^block)(NSString *, NSString *) = (__bridge void (^)(NSString *, NSString *))data;
+      dispatch_async(dispatch_get_main_queue(), ^{ block(levelStr, textStr); });
+    }, retained_log_block);
   } else {
-      whisper_log_set(whisper_log_callback_default, nullptr);
-      if (retained_log_block) {
-          CFRelease(retained_log_block);
-          retained_log_block = nullptr;
-      }
+    whisper_log_set(whisper_log_callback_default, nullptr);
+    if (retained_log_block) { CFRelease(retained_log_block); retained_log_block = nullptr; }
   }
 }
 
@@ -279,11 +273,17 @@ void AudioInputCallback(void * inUserData,
             state->job->audio_output_path
         );
     }
-    state->transcribeHandler(state->job->job_id, @"end", result);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        state->transcribeHandler(state->job->job_id, @"end", result);
+    });
 
     // Clean up callback data before removing job
     if (state->job->params.new_segment_callback_user_data) {
         cleanup_callback_data(&state->job->params.new_segment_callback_user_data);
+    }
+    if (state->job->params.progress_callback_user_data) {
+        Block_release(state->job->params.progress_callback_user_data);
+        state->job->params.progress_callback_user_data = nullptr;
     }
 
     rnwhisper::job_remove(state->job->job_id);
@@ -346,10 +346,14 @@ void AudioInputCallback(void * inUserData,
         [state->mSelf finishRealtimeTranscribe:state result:result];
     } else if (code == 0) {
         result[@"isCapturing"] = @(true);
-        state->transcribeHandler(state->job->job_id, @"transcribe", result);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            state->transcribeHandler(state->job->job_id, @"transcribe", result);
+        });
     } else {
         result[@"isCapturing"] = @(true);
-        state->transcribeHandler(state->job->job_id, @"transcribe", result);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            state->transcribeHandler(state->job->job_id, @"transcribe", result);
+        });
     }
 
     if (continueNeeded) {
@@ -441,10 +445,10 @@ void cleanup_callback_data(void **user_data_ptr) {
 
         if (options[@"onProgress"] && [options[@"onProgress"] boolValue]) {
             params.progress_callback = [](struct whisper_context * /*ctx*/, struct whisper_state * /*state*/, int progress, void * user_data) {
-                void (^onProgress)(int) = (__bridge void (^)(int))user_data;
-                onProgress(progress);
+                void (^block)(int) = (void (^)(int))user_data;
+                dispatch_async(dispatch_get_main_queue(), ^{ block(progress); });
             };
-            params.progress_callback_user_data = (__bridge void *)(onProgress);
+            params.progress_callback_user_data = Block_copy(onProgress);
         }
 
         if (options[@"onNewSegments"] && [options[@"onNewSegments"] boolValue]) {
@@ -528,11 +532,15 @@ void cleanup_callback_data(void **user_data_ptr) {
         if (job->params.new_segment_callback_user_data) {
             cleanup_callback_data(&job->params.new_segment_callback_user_data);
         }
+        if (job->params.progress_callback_user_data) {
+            Block_release(job->params.progress_callback_user_data);
+            job->params.progress_callback_user_data = nullptr;
+        }
 
         rnwhisper::job_remove(jobId);
         self->recordState.job = nullptr;
         self->recordState.isTranscribing = false;
-        onEnd(code);
+        dispatch_async(dispatch_get_main_queue(), ^{ onEnd(code); });
     });
 }
 
@@ -583,7 +591,7 @@ void cleanup_callback_data(void **user_data_ptr) {
     params.print_timestamps = false;
     params.print_special    = false;
     params.translate        = options[@"translate"] != nil ? [options[@"translate"] boolValue] : false;
-    params.language         = options[@"language"] != nil ? strdup([options[@"language"] UTF8String]) : "auto";
+    params.language         = options[@"language"] != nil ? strdup([options[@"language"] UTF8String]) : nullptr;
     params.n_threads        = n_threads > 0 ? n_threads : default_n_threads;
     params.offset_ms        = 0;
     params.no_context       = true;
@@ -628,7 +636,23 @@ void cleanup_callback_data(void **user_data_ptr) {
   audioDataCount:(int)audioDataCount
 {
     whisper_reset_timings(self->ctx);
+
+    // Track if we need to free language and prompt
+    bool owns_language = job->params.language != nullptr;
+    bool owns_prompt = job->params.initial_prompt != nullptr;
+
     int code = whisper_full(self->ctx, job->params, audioData, audioDataCount);
+
+    // Free allocated strings after whisper_full returns
+    if (owns_language && job->params.language) {
+        free((void*)job->params.language);
+        job->params.language = nullptr;
+    }
+    if (owns_prompt && job->params.initial_prompt) {
+        free((void*)job->params.initial_prompt);
+        job->params.initial_prompt = nullptr;
+    }
+
     if (job && job->is_aborted()) code = -999;
     // if (code == 0) {
     //     whisper_print_timings(self->ctx);
