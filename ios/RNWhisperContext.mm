@@ -452,10 +452,10 @@ void cleanup_callback_data(void **user_data_ptr) {
 
         if (options[@"onProgress"] && [options[@"onProgress"] boolValue]) {
             params.progress_callback = [](struct whisper_context * /*ctx*/, struct whisper_state * /*state*/, int progress, void * user_data) {
-                void (^block)(int) = (void (^)(int))user_data;
+                void (^block)(int) = (__bridge void (^)(int))user_data;
                 dispatch_async(dispatch_get_main_queue(), ^{ block(progress); });
             };
-            params.progress_callback_user_data = Block_copy(onProgress);
+            params.progress_callback_user_data = (__bridge_retained void *)[onProgress copy];
         }
 
         if (options[@"onNewSegments"] && [options[@"onNewSegments"] boolValue]) {
@@ -511,7 +511,7 @@ void cleanup_callback_data(void **user_data_ptr) {
                         @"segments": [segments copy]                          // immutable copy
                     };
 
-                    void (^onNewSegments)(NSDictionary *) = (void (^)(NSDictionary *))data->onNewSegments;
+                    void (^onNewSegments)(NSDictionary *) = (__bridge void (^)(NSDictionary *))data->onNewSegments;
                     if (onNewSegments) {
                         dispatch_async(dispatch_get_main_queue(), ^{
                             onNewSegments(result);
@@ -523,7 +523,7 @@ void cleanup_callback_data(void **user_data_ptr) {
             // IMPORTANT: user_data must outlive the callback, and blocks must be copied to the heap.
             struct rnwhisper_segments_callback_data *user_data =
                 (struct rnwhisper_segments_callback_data *)calloc(1, sizeof(*user_data));
-            user_data->onNewSegments = Block_copy(onNewSegments);
+            user_data->onNewSegments = (__bridge_retained void *)[onNewSegments copy];
             user_data->tdrzEnable = (options[@"tdrzEnable"] && [options[@"tdrzEnable"] boolValue]);
             user_data->total_n_new = 0;
             user_data->isHeapAllocated = true;
